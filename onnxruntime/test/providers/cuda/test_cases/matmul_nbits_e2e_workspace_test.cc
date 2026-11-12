@@ -28,8 +28,9 @@
 
 #include "gtest/gtest.h"
 
-#if !defined(DISABLE_CONTRIB_OPS) && defined(USE_FPA_INTB_GEMM) && USE_FPA_INTB_GEMM
+#if !defined(USE_CUDA_MINIMAL) && !defined(DISABLE_CONTRIB_OPS)
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <iostream>
@@ -78,7 +79,9 @@ constexpr int64_t kE2eK = 1024;
 constexpr int64_t kE2eM = 256;
 constexpr int64_t kE2eBlockSize = 32;
 constexpr int64_t kE2eBits = 4;
+#if USE_FPA_INTB_GEMM
 constexpr int64_t kWeightPrepackedSm80 = 1;
+#endif
 constexpr uint16_t kHalfOne = 0x3C00;  // 1.0 in IEEE-754 half precision.
 
 // Builds a minimal single-node MatMulNBits model and returns its serialized ModelProto bytes.
@@ -95,7 +98,8 @@ std::string BuildMatMulNBitsModelBytes(const char* m_dim_param = nullptr,
                                        int64_t m_dim_value = kE2eM,
                                        int64_t n = kE2eN,
                                        int64_t k = kE2eK,
-                                       uint8_t packed_weight_byte = 0) {
+                                       uint8_t packed_weight_byte = 0,
+                                       [[maybe_unused]] bool include_bias = true) {
   const int64_t k_blocks = (k + kE2eBlockSize - 1) / kE2eBlockSize;
   const int64_t blob_size = (kE2eBlockSize * kE2eBits + 7) / 8;  // 16
 
@@ -164,11 +168,13 @@ std::string BuildMatMulNBitsModelBytes(const char* m_dim_param = nullptr,
 #if !USE_COMPACT_FPA_INTB_GEMM
   // Bias initializer: fp16 {N}, zero-filled. Supplying it after two omitted optional inputs is the
   // regression layout for positional Level-2 input-shape resolution.
-  auto* bias = graph->add_initializer();
-  bias->set_name("bias");
-  bias->set_data_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT16);
-  bias->add_dims(n);
-  bias->mutable_raw_data()->assign(static_cast<size_t>(n * sizeof(uint16_t)), '\0');
+  if (include_bias) {
+    auto* bias = graph->add_initializer();
+    bias->set_name("bias");
+    bias->set_data_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT16);
+    bias->add_dims(n);
+    bias->mutable_raw_data()->assign(static_cast<size_t>(n * sizeof(uint16_t)), '\0');
+  }
 #endif
 
   // MatMulNBits node.
@@ -184,7 +190,7 @@ std::string BuildMatMulNBitsModelBytes(const char* m_dim_param = nullptr,
 #if USE_COMPACT_FPA_INTB_GEMM
   node->add_input("");
 #else
-  node->add_input("bias");
+  node->add_input(include_bias ? "bias" : "");
 #endif
   node->add_output("Y");
   auto add_int_attr = [node](const char* name, int64_t v) {
@@ -207,6 +213,7 @@ std::string BuildMatMulNBitsModelBytes(const char* m_dim_param = nullptr,
   return bytes;
 }
 
+#if USE_FPA_INTB_GEMM
 // Builds a trivial single-node fp32 Add model (X + Y -> Z, all [kAddM, kAddN]) and returns its
 // serialized ModelProto bytes. Used by Test E as a control: Add does NOT override
 // DeclareWorkspaceRequirements, so it must hit the OpKernel base-class no-op.
@@ -254,6 +261,8 @@ std::string BuildAddModelBytes() {
   return bytes;
 }
 
+#endif  // USE_FPA_INTB_GEMM
+
 // fpA_intB eligibility requires compute capability >= 7.5 (see CheckFpAIntBEligibility in
 // matmul_nbits.cc). Returns the compute capability (major*10+minor) of CUDA device 0, or -1 when no
 // device is present. Tests that exercise the fpA_intB-eligible path must skip on older GPUs (rather
@@ -270,8 +279,10 @@ int CudaDeviceComputeCapabilityOrNegative() {
   return prop.major * 10 + prop.minor;
 }
 
+#if USE_FPA_INTB_GEMM
 // Minimum compute capability for the fpA_intB path (mirrors the production eligibility gate).
 constexpr int kMinFpAIntBSm = 75;
+#endif
 
 // Returns the first node in `graph` whose op type matches `op_type`, or nullptr if none.
 const Node* FindNodeByOpType(const Graph& graph, const std::string& op_type) {
@@ -283,8 +294,10 @@ const Node* FindNodeByOpType(const Graph& graph, const std::string& op_type) {
   return nullptr;
 }
 
-std::optional<size_t> EstimateWorkspaceFromGraphProtoShape(
-    gsl::span<const int64_t> input_a_shape) {
+std::optional<Level1MemoryEstimate> EstimateMemoryFromGraphProtoShape(
+    gsl::span<const int64_t> input_a_shape,
+    contrib::cuda::MatMulNBitsMemoryEstimateOptions options = {},
+    gsl::span<const int64_t> inferred_shape = {}) {
   ONNX_NAMESPACE::TypeProto input_type;
   auto* tensor_type = input_type.mutable_tensor_type();
   tensor_type->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT16);
@@ -314,12 +327,24 @@ std::optional<size_t> EstimateWorkspaceFromGraphProtoShape(
   cudaDeviceProp device_prop{};
   device_prop.major = 8;
   device_prop.minor = 0;
-  device_prop.multiProcessorCount = 100;
-  return EstimateMatMulNBitsWorkspaceForTest(&node, device_prop);
+  device_prop.multiProcessorCount = 108;
+  return inferred_shape.empty()
+             ? EstimateMatMulNBitsMemoryForTest(&node, device_prop, options)
+             : EstimateMatMulNBitsMemoryForTest(&node, inferred_shape, device_prop, options);
 }
+
+#if USE_FPA_INTB_GEMM
+std::optional<size_t> EstimateWorkspaceFromGraphProtoShape(
+    gsl::span<const int64_t> input_a_shape) {
+  const auto estimate = EstimateMemoryFromGraphProtoShape(input_a_shape);
+  return estimate.has_value() ? estimate->runtime_workspace_bytes : std::nullopt;
+}
+#endif
 
 }  // namespace
 
+#if USE_FPA_INTB_GEMM
+// Charge lazy prefill scratch without adding decode's constructor-only rotating buffers.
 TEST(MatMulNBitsWorkspace, GetCapabilityBudgetChargesLazyProfileScratch) {
   const int device_sm = CudaDeviceComputeCapabilityOrNegative();
   if (device_sm < 0) {
@@ -335,9 +360,10 @@ TEST(MatMulNBitsWorkspace, GetCapabilityBudgetChargesLazyProfileScratch) {
   ScopedEnvironmentVariables scoped_env(
       EnvVarMap{{"ORT_FPA_INTB_GEMM", optional<std::string>{"0"}},
                 {"ORT_FPA_INTB_PROFILE_M", optional<std::string>{"2048"}}});
-  const std::string model_bytes = BuildMatMulNBitsModelBytes();
+  const std::string model_bytes = BuildMatMulNBitsModelBytes(
+      nullptr, 0, kE2eM, kE2eN, kE2eK, 0, false);
 
-  // profile_m=1 limits constructor profiling to M=1. The first M=256 run therefore performs lazy
+  // profile_m=1,16 limits constructor profiling to M=1 and M=16. The first M=256 run performs lazy
   // profiling. Its scratch is runtime transient memory and must be included in the hard budget,
   // while constructor-profile and PrePack_B scratch remain a non-additive initialization peak.
   {
@@ -345,7 +371,7 @@ TEST(MatMulNBitsWorkspace, GetCapabilityBudgetChargesLazyProfileScratch) {
     ASSERT_STATUS_OK(so.config_options.AddConfigEntry(
         kOrtSessionOptionsCudaFpAIntBGemm, "1"));
     ASSERT_STATUS_OK(so.config_options.AddConfigEntry(
-        kOrtSessionOptionsCudaFpAIntBProfileM, "1"));
+        kOrtSessionOptionsCudaFpAIntBProfileM, "1,16"));
     ASSERT_STATUS_OK(so.config_options.AddConfigEntry(
         kOrtSessionOptionsResourceCudaPartitioningSettings, "2048,"));
     InferenceSessionWrapper session(so, GetEnvironment());
@@ -360,11 +386,34 @@ TEST(MatMulNBitsWorkspace, GetCapabilityBudgetChargesLazyProfileScratch) {
 
     const auto estimate = EstimateMatMulNBitsMemoryForTest(
         mm_node, cuda_ep->GetDeviceProp(),
-        {/*fpa_intb_gemm=*/std::string_view{"1"}, /*profile_m=*/std::string_view{"1"}});
+        {/*fpa_intb_gemm=*/std::string_view{"1"}, /*profile_m=*/std::string_view{"1,16"}});
     ASSERT_TRUE(estimate.has_value());
     ASSERT_TRUE(estimate->runtime_workspace_bytes.has_value());
-    EXPECT_GT(estimate->runtime_transient_bytes, *estimate->runtime_workspace_bytes);
-    EXPECT_GT(estimate->runtime_transient_bytes, estimate->initialization_scratch_bytes);
+    const size_t packed_weight_bytes = static_cast<size_t>(kE2eN * kE2eK) / 2;
+    const size_t scale_bytes = static_cast<size_t>(kE2eN * kE2eK / kE2eBlockSize) * sizeof(uint16_t);
+    const size_t matrix_bytes = packed_weight_bytes + scale_bytes;
+    const size_t l2_bytes = static_cast<size_t>(cuda_ep->GetDeviceProp().l2CacheSize);
+    ASSERT_LE(matrix_bytes, l2_bytes);
+    const auto expected_profile_scratch = [&](size_t profile_m, size_t streaming_l2_bytes) {
+      const size_t copies = streaming_l2_bytes == 0 ? 1 : 2 * streaming_l2_bytes / matrix_bytes + 1;
+      const size_t runner_workspace = ((profile_m + 15) / 16) * ((kE2eN + 63) / 64) * 7 * sizeof(float);
+      const std::array<size_t, 7> buffers{
+          profile_m * kE2eK * sizeof(uint16_t), packed_weight_bytes * copies, scale_bytes * copies,
+          scale_bytes, kE2eN * sizeof(uint16_t), profile_m * kE2eN * sizeof(uint16_t), runner_workspace};
+      size_t scratch = 0;
+      for (size_t bytes : buffers) {
+        scratch += (bytes + 127) / 128 * 128;
+      }
+      return scratch;
+    };
+    const size_t streaming_decode_scratch = expected_profile_scratch(1, l2_bytes);
+    const size_t larger_bucket_scratch = expected_profile_scratch(16, 0);
+    const size_t prepack_scratch = packed_weight_bytes + 32 * sizeof(int32_t);
+    ASSERT_GT(streaming_decode_scratch, larger_bucket_scratch);
+    EXPECT_EQ(estimate->initialization_scratch_bytes,
+              std::max({streaming_decode_scratch, larger_bucket_scratch, prepack_scratch}));
+    EXPECT_EQ(estimate->runtime_transient_bytes, expected_profile_scratch(kE2eM, 0));
+    EXPECT_LT(estimate->runtime_transient_bytes, expected_profile_scratch(kE2eM, l2_bytes));
 
     std::vector<MLFloat16> a_data(static_cast<size_t>(kE2eM * kE2eK), MLFloat16(0.0f));
     OrtValue a_value;
@@ -382,7 +431,7 @@ TEST(MatMulNBitsWorkspace, GetCapabilityBudgetChargesLazyProfileScratch) {
     ASSERT_STATUS_OK(so.config_options.AddConfigEntry(
         kOrtSessionOptionsCudaFpAIntBGemm, "1"));
     ASSERT_STATUS_OK(so.config_options.AddConfigEntry(
-        kOrtSessionOptionsCudaFpAIntBProfileM, "1"));
+        kOrtSessionOptionsCudaFpAIntBProfileM, "1,16"));
     ASSERT_STATUS_OK(so.config_options.AddConfigEntry(
         kOrtSessionOptionsResourceCudaPartitioningSettings, "430,"));
     InferenceSessionWrapper session(so, GetEnvironment());
@@ -395,6 +444,185 @@ TEST(MatMulNBitsWorkspace, GetCapabilityBudgetChargesLazyProfileScratch) {
     ASSERT_NE(mm_node, nullptr);
     EXPECT_NE(mm_node->GetExecutionProviderType(), kCudaExecutionProvider);
   }
+}
+
+#endif  // USE_FPA_INTB_GEMM
+
+TEST(MatMulNBitsWorkspace, LegacyLevel1EstimateRemainsAvailableWithoutFpA) {
+  ScopedEnvironmentVariables scoped_env(
+      EnvVarMap{{"ORT_MATMULNBITS_FORCE_CHUNKED", optional<std::string>{"0"}}});
+  const std::array<int64_t, 2> shape{kE2eM, kE2eK};
+  const auto estimate = EstimateMemoryFromGraphProtoShape(
+      shape, {/*fpa_intb_gemm=*/std::string_view{"0"}});
+  ASSERT_TRUE(estimate.has_value());
+  EXPECT_EQ(estimate->runtime_workspace_bytes,
+            std::optional<size_t>{kE2eN * kE2eK * sizeof(MLFloat16)});
+  EXPECT_EQ(estimate->runtime_transient_bytes, 0U);
+  EXPECT_EQ(estimate->persistent_prepack_bytes, 0U);
+  EXPECT_EQ(estimate->initialization_scratch_bytes, 0U);
+}
+
+TEST(MatMulNBitsWorkspace, GetCapabilityBudgetChargesLegacyDequantWorkspace) {
+  if (CudaDeviceComputeCapabilityOrNegative() < 0) {
+    GTEST_SKIP() << "No CUDA device available; skipping budget integration test.";
+  }
+
+  ScopedEnvironmentVariables scoped_env(
+      EnvVarMap{{"ORT_FPA_INTB_GEMM", optional<std::string>{"0"}},
+                {"ORT_MATMULNBITS_FORCE_CHUNKED", optional<std::string>{"0"}}});
+  const std::string model_bytes = BuildMatMulNBitsModelBytes(
+      nullptr, 0, kE2eM, kE2eN, kE2eK, 0, false);
+
+  auto make_session_options = [](size_t memory_limit_kb) {
+    SessionOptions session_options;
+    ORT_THROW_IF_ERROR(session_options.config_options.AddConfigEntry(
+        kOrtSessionOptionsCudaFpAIntBGemm, "0"));
+    const std::string partitioning_settings =
+        std::to_string(memory_limit_kb) + ",";
+    ORT_THROW_IF_ERROR(session_options.config_options.AddConfigEntry(
+        kOrtSessionOptionsResourceCudaPartitioningSettings,
+        partitioning_settings.c_str()));
+    return session_options;
+  };
+
+  {
+    InferenceSessionWrapper session(make_session_options(1024),
+                                    GetEnvironment());
+    auto cuda_ep =
+        std::make_shared<CUDAExecutionProvider>(
+            CUDAExecutionProviderInfo{});
+    ASSERT_STATUS_OK(session.RegisterExecutionProvider(cuda_ep));
+    ASSERT_STATUS_OK(session.Load(
+        model_bytes.data(), static_cast<int>(model_bytes.size())));
+    ASSERT_STATUS_OK(session.Initialize());
+
+    const Node* node =
+        FindNodeByOpType(session.GetGraph(), "MatMulNBits");
+    ASSERT_NE(node, nullptr);
+    ASSERT_EQ(node->GetExecutionProviderType(),
+              kCudaExecutionProvider);
+    const auto estimate = EstimateMatMulNBitsMemoryForTest(
+        node, cuda_ep->GetDeviceProp(),
+        {/*fpa_intb_gemm=*/std::string_view{"0"}});
+    ASSERT_TRUE(estimate.has_value());
+    ASSERT_TRUE(estimate->runtime_workspace_bytes.has_value());
+    EXPECT_EQ(*estimate->runtime_workspace_bytes,
+              size_t{kE2eN * kE2eK * sizeof(MLFloat16)});
+    EXPECT_EQ(estimate->persistent_prepack_bytes, 0U);
+    EXPECT_EQ(estimate->initialization_scratch_bytes, 0U);
+  }
+
+  {
+    // Static accounting plus the generic 50% fallback is below 500 KiB.
+    // The route-complete legacy dequant estimate is above it.
+    InferenceSessionWrapper session(make_session_options(500),
+                                    GetEnvironment());
+    ASSERT_STATUS_OK(session.RegisterExecutionProvider(
+        std::make_shared<CUDAExecutionProvider>(
+            CUDAExecutionProviderInfo{})));
+    ASSERT_STATUS_OK(session.Load(
+        model_bytes.data(), static_cast<int>(model_bytes.size())));
+    ASSERT_STATUS_OK(session.Initialize());
+
+    const Node* node =
+        FindNodeByOpType(session.GetGraph(), "MatMulNBits");
+    ASSERT_NE(node, nullptr);
+    EXPECT_NE(node->GetExecutionProviderType(),
+              kCudaExecutionProvider);
+  }
+}
+
+#if USE_FPA_INTB_GEMM
+
+TEST(MatMulNBitsWorkspace, RuntimeTransientPeakCoversRetainedWorkspaceDuringLazyTailProfiling) {
+  ScopedEnvironmentVariables scoped_env(
+      EnvVarMap{{"ORT_MATMULNBITS_FORCE_CHUNKED", optional<std::string>{"1"}}});
+  struct TestCase {
+    int64_t m;
+    const char* chunk_size;
+    const char* profile_m;
+    size_t workspace_bytes;
+    size_t preparation_peak_bytes;
+  };
+  const TestCase cases[]{
+      // The 4096-row GEMM retains 28,672 bytes while the 2048-row tail profiles with 5,421,568 bytes.
+      {6144, "4096", "1,4096", 28672, 5450240},
+      {384, "256", "1,256", 1792, 494720},
+      // Dynamic M can also encounter an unprofiled partial tail.
+      {-1, "4096", "1,4096", 28672, 5450240},
+      // A single launch profiles before allocating its ordinary workspace.
+      {2048, "4096", "1,4096", 14336, 5421568},
+      {384, "256", "1,2,4,8,16,32,64,128,256", 1792, 0},
+  };
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(MakeString("M=", test_case.m, ", chunk_size=", test_case.chunk_size,
+                            ", profile_m=", test_case.profile_m));
+    const std::array<int64_t, 2> shape{test_case.m, kE2eK};
+    const auto estimate = EstimateMemoryFromGraphProtoShape(
+        shape,
+        {/*fpa_intb_gemm=*/std::string_view{"1"},
+         /*profile_m=*/std::string_view{test_case.profile_m},
+         /*input_shape_is_upper_bound=*/false,
+         /*m_chunk_size=*/std::string_view{test_case.chunk_size}});
+    ASSERT_TRUE(estimate.has_value());
+    EXPECT_EQ(estimate->runtime_workspace_bytes,
+              std::optional<size_t>{test_case.workspace_bytes});
+    EXPECT_EQ(estimate->runtime_transient_bytes, test_case.preparation_peak_bytes);
+  }
+}
+
+TEST(MatMulNBitsWorkspace, Level1ChunkOptionsOverrideEnvironmentAndCapConstructorProfiling) {
+  ScopedEnvironmentVariables scoped_env(
+      EnvVarMap{{"ORT_FPA_INTB_GEMM", optional<std::string>{"0"}},
+                {"ORT_FPA_INTB_PROFILE_M", optional<std::string>{"1,4096"}},
+                {"ORT_MATMULNBITS_M_CHUNK_SIZE", optional<std::string>{"4096"}},
+                {"ORT_MATMULNBITS_FORCE_CHUNKED", optional<std::string>{"1"}}});
+  const std::array<int64_t, 2> shape{512, kE2eK};
+  const auto estimate = EstimateMemoryFromGraphProtoShape(
+      shape, {/*fpa_intb_gemm=*/std::string_view{"1"},
+              /*profile_m=*/std::string_view{"1,2,4,8,16,32,64,128,256"},
+              /*input_shape_is_upper_bound=*/false,
+              /*m_chunk_size=*/std::string_view{"256"}});
+  ASSERT_TRUE(estimate.has_value());
+  EXPECT_EQ(estimate->runtime_workspace_bytes, std::optional<size_t>{1792});
+  EXPECT_EQ(estimate->runtime_transient_bytes, 0U);
+
+  const auto capped = EstimateMemoryFromGraphProtoShape(
+      shape, {/*fpa_intb_gemm=*/std::string_view{"1"},
+              /*profile_m=*/std::string_view{"1,4096"},
+              /*input_shape_is_upper_bound=*/false,
+              /*m_chunk_size=*/std::string_view{"256"}});
+  const auto unchunked = EstimateMemoryFromGraphProtoShape(
+      shape, {/*fpa_intb_gemm=*/std::string_view{"1"},
+              /*profile_m=*/std::string_view{"1,4096"},
+              /*input_shape_is_upper_bound=*/false,
+              /*m_chunk_size=*/std::string_view{"0"}});
+  ASSERT_TRUE(capped.has_value());
+  ASSERT_TRUE(unchunked.has_value());
+  EXPECT_LT(capped->initialization_scratch_bytes, unchunked->initialization_scratch_bytes);
+}
+
+TEST(MatMulNBitsWorkspace, Level1UpperBoundIncludesUnchunkedRowsBelowSizeGate) {
+  ScopedEnvironmentVariables scoped_env(
+      EnvVarMap{{"ORT_MATMULNBITS_FORCE_CHUNKED", optional<std::string>{"0"}}});
+  // For N=256/K=1024 FP16, M=104857 is still unchunked; M=104858 is split into 256-row launches.
+  const std::array<int64_t, 2> max_shape{104858, kE2eK};
+  const std::array<int64_t, 2> dynamic_shape{-1, kE2eK};
+  const auto bounded = EstimateMemoryFromGraphProtoShape(
+      dynamic_shape, {/*fpa_intb_gemm=*/std::string_view{"1"},
+                      /*profile_m=*/std::string_view{"1,256"},
+                      /*input_shape_is_upper_bound=*/true,
+                      /*m_chunk_size=*/std::string_view{"256"}},
+      max_shape);
+  const auto exact = EstimateMemoryFromGraphProtoShape(
+      max_shape, {/*fpa_intb_gemm=*/std::string_view{"1"},
+                  /*profile_m=*/std::string_view{"1,256"},
+                  /*input_shape_is_upper_bound=*/false,
+                  /*m_chunk_size=*/std::string_view{"256"}});
+  ASSERT_TRUE(bounded.has_value());
+  ASSERT_TRUE(exact.has_value());
+  EXPECT_EQ(bounded->runtime_workspace_bytes, std::optional<size_t>{734048});
+  EXPECT_EQ(exact->runtime_workspace_bytes, std::optional<size_t>{1792});
 }
 
 TEST(MatMulNBitsWorkspace, MaxShapeBudgetChargesMissingSmallerProfileBucket) {
@@ -1177,7 +1405,9 @@ TEST(MatMulNBitsWorkspace, NonMatMulNBitsKernelDeclaresNoWorkspace) {
       << "A kernel that does not override DeclareWorkspaceRequirements must report no workspace.";
 }
 
+#endif  // USE_FPA_INTB_GEMM
+
 }  // namespace test
 }  // namespace onnxruntime
 
-#endif  // !defined(DISABLE_CONTRIB_OPS) && USE_FPA_INTB_GEMM
+#endif  // !defined(USE_CUDA_MINIMAL) && !defined(DISABLE_CONTRIB_OPS)

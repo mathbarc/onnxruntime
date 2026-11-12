@@ -28,6 +28,7 @@
 #include "test/util/include/default_providers.h"
 #include "test/util/include/scoped_env_vars.h"
 #ifdef USE_CUDA
+#include "contrib_ops/cuda/bert/attention_kernel_options.h"
 #include "test/common/cuda_op_test_utils.h"
 #endif
 #if defined(USE_CUDA) || defined(USE_WEBGPU)
@@ -46,6 +47,46 @@
 namespace onnxruntime {
 namespace test {
 
+#ifdef USE_CUDA
+// Restrict native H512 GQA to supported GPUs and compatible, unquantized grouped-head caches.
+TEST(GroupQueryAttentionTest, NativeH512FallbackEligibility) {
+  contrib::GroupQueryAttentionParameters parameters{};
+  parameters.sequence_length = 1;
+  parameters.is_first_prompt = false;
+  parameters.num_heads = 8;
+  parameters.kv_num_heads = 1;
+  parameters.head_size = 512;
+  parameters.past_kv_format = contrib::AttentionQkvFormat::Q_K_V_BNSH;
+  for (int device_major : {5, 6, 7, 8, 9, 10, 12}) {
+    EXPECT_EQ(contrib::cuda::PreferNativeGqa(parameters, device_major, false, false), device_major >= 8);
+  }
+  parameters.is_first_prompt = true;
+  EXPECT_FALSE(contrib::cuda::PreferNativeGqa(parameters, 8, false, false));
+  parameters.is_first_prompt = false;
+  for (int sequence_length : {0, 2, 8192, 16384}) {
+    parameters.sequence_length = sequence_length;
+    EXPECT_FALSE(contrib::cuda::PreferNativeGqa(parameters, 8, false, false));
+  }
+  parameters.sequence_length = 1;
+  EXPECT_FALSE(contrib::cuda::PreferNativeGqa(parameters, 8, true, false));
+  EXPECT_FALSE(contrib::cuda::PreferNativeGqa(parameters, 8, false, true));
+  parameters.use_smooth_softmax = true;
+  EXPECT_FALSE(contrib::cuda::PreferNativeGqa(parameters, 8, false, false));
+  parameters.use_smooth_softmax = false;
+  parameters.past_kv_format = contrib::AttentionQkvFormat::Q_K_V_BSNH;
+  EXPECT_FALSE(contrib::cuda::PreferNativeGqa(parameters, 8, false, false));
+  parameters.past_kv_format = contrib::AttentionQkvFormat::Q_K_V_BNSH;
+  parameters.kv_num_heads = parameters.num_heads;
+  EXPECT_FALSE(contrib::cuda::PreferNativeGqa(parameters, 8, false, false));
+  parameters.kv_num_heads = 1;
+  for (int head_size : {64, 128, 256}) {
+    parameters.head_size = head_size;
+    EXPECT_FALSE(contrib::cuda::PreferNativeGqa(parameters, 8, false, false));
+  }
+}
+#endif
+
+// Unknown L2 cache sizes retain the conservative FlashAttention block sizes.
 TEST(GroupQueryAttentionTest, FlashAttentionBlockSizesUseFallbackForUnknownL2Cache) {
   constexpr int head_size = 128;
 
@@ -60,6 +101,7 @@ TEST(GroupQueryAttentionTest, FlashAttentionBlockSizesUseFallbackForUnknownL2Cac
   EXPECT_EQ(unavailable_cache_sizes.kv_block_size, zero_cache_sizes.kv_block_size);
 }
 
+// A detected L2 cache permits the larger FlashAttention KV block.
 TEST(GroupQueryAttentionTest, FlashAttentionBlockSizesUseDetectedL2Cache) {
   constexpr int head_size = 128;
   constexpr int l2_cache_size = 4 * 1024 * 1024;
@@ -867,7 +909,9 @@ static void RunCudaQKNormInputContractTest(
     bool include_q_norm_weight = true,
     bool include_k_norm_weight = true,
     int q_norm_weight_size = 8,
-    int k_norm_weight_size = 8) {
+    int k_norm_weight_size = 8,
+    std::optional<float> q_norm_epsilon = std::nullopt,
+    std::optional<float> k_norm_epsilon = std::nullopt) {
   auto cuda_ep = DefaultCudaExecutionProvider();
   if (!cuda_ep) {
     GTEST_SKIP() << "CUDA EP not available";
@@ -887,6 +931,8 @@ static void RunCudaQKNormInputContractTest(
   if (qk_norm_epsilon.has_value()) {
     tester.AddAttribute<float>("qk_norm_epsilon", *qk_norm_epsilon);
   }
+  if (q_norm_epsilon.has_value()) tester.AddAttribute<float>("q_norm_epsilon", *q_norm_epsilon);
+  if (k_norm_epsilon.has_value()) tester.AddAttribute<float>("k_norm_epsilon", *k_norm_epsilon);
 
   tester.AddInput<MLFloat16>("query", {batch_size, sequence_length, hidden_size},
                              std::vector<MLFloat16>(batch_size * sequence_length * hidden_size, MLFloat16(0.1f)));
@@ -970,6 +1016,19 @@ TEST(GroupQueryAttentionTest, CudaRejectsNegativeQKNormEpsilon) {
   RunCudaQKNormInputContractTest(OpTester::ExpectResult::kExpectFailure,
                                  "qk_norm_epsilon must be finite and positive",
                                  -1.0e-6f);
+}
+
+TEST(GroupQueryAttentionTest, CudaRejectsInvalidSeparateQKNormEpsilons) {
+  for (float epsilon : {0.0f, -1e-6f, std::numeric_limits<float>::infinity(),
+                        std::numeric_limits<float>::quiet_NaN()}) {
+    SCOPED_TRACE(epsilon);
+    RunCudaQKNormInputContractTest(OpTester::ExpectResult::kExpectFailure,
+                                   "q_norm_epsilon must be finite and positive",
+                                   std::nullopt, true, true, 8, 8, epsilon, std::nullopt);
+    RunCudaQKNormInputContractTest(OpTester::ExpectResult::kExpectFailure,
+                                   "k_norm_epsilon must be finite and positive",
+                                   std::nullopt, true, true, 8, 8, std::nullopt, epsilon);
+  }
 }
 
 // Regression: negative seqlens_k wraps to huge size_t, causing GEMM OOB.
@@ -1357,7 +1416,11 @@ static std::vector<float> RunGQARotaryWithOptionalQKNorm(
     int num_heads,
     int kv_num_heads,
     int head_size,
-    float qk_norm_epsilon) {
+    float qk_norm_epsilon,
+    std::optional<float> q_norm_epsilon = std::nullopt,
+    std::optional<float> k_norm_epsilon = std::nullopt,
+    OpTester::ExpectResult expect = OpTester::ExpectResult::kExpectSuccess,
+    const std::string& expected_message = "") {
   const int hidden_size = num_heads * head_size;
   const int kv_hidden_size = kv_num_heads * head_size;
   const int total_sequence_length = past_seq_len + sequence_length;
@@ -1367,6 +1430,8 @@ static std::vector<float> RunGQARotaryWithOptionalQKNorm(
   tester.AddAttribute<int64_t>("kv_num_heads", static_cast<int64_t>(kv_num_heads));
   tester.AddAttribute<int64_t>("do_rotary", static_cast<int64_t>(1));
   tester.AddAttribute<float>("qk_norm_epsilon", qk_norm_epsilon);
+  if (q_norm_epsilon.has_value()) tester.AddAttribute<float>("q_norm_epsilon", *q_norm_epsilon);
+  if (k_norm_epsilon.has_value()) tester.AddAttribute<float>("k_norm_epsilon", *k_norm_epsilon);
 
   tester.AddInput<float>("query", {batch_size, sequence_length, hidden_size}, query_data);
   tester.AddInput<float>("key", {batch_size, sequence_length, kv_hidden_size}, key_data);
@@ -1446,11 +1511,82 @@ static std::vector<float> RunGQARotaryWithOptionalQKNorm(
   } else {
     execution_providers.push_back(DefaultCpuExecutionProvider());
   }
-  tester.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+  SessionOptions session_options;
+  if (use_webgpu) {
+    ORT_THROW_IF_ERROR(session_options.config_options.AddConfigEntry(kOrtSessionOptionsDisableCPUEPFallback, "1"));
+  }
+  tester.Run(session_options, expect, expected_message, {}, nullptr, &execution_providers);
+  if (expect == OpTester::ExpectResult::kExpectFailure) return {};
 
   auto fetches = tester.GetFetches();
   const float* out_data = fetches[0].Get<Tensor>().Data<float>();
   return std::vector<float>(out_data, out_data + output_size);
+}
+
+TEST(GroupQueryAttentionTest, WebGpuRejectsInvalidQKNormEpsilonOverrides) {
+  if (!DefaultWebGpuExecutionProvider()) {
+    GTEST_SKIP() << "WebGPU EP not available";
+  }
+  const std::vector<float> data(16, 0.1f);
+  const std::vector<float> weight(16, 1.0f);
+  for (float epsilon : {0.0f, -1e-6f, std::numeric_limits<float>::infinity(),
+                        std::numeric_limits<float>::quiet_NaN()}) {
+    SCOPED_TRACE(epsilon);
+    RunGQARotaryWithOptionalQKNorm(
+        true, data, data, data, data, data, &weight, &weight,
+        1, 1, 1, 1, 1, 16, 1e-6f, epsilon, std::nullopt,
+        OpTester::ExpectResult::kExpectFailure, "q_norm_epsilon must be finite and positive");
+    RunGQARotaryWithOptionalQKNorm(
+        true, data, data, data, data, data, &weight, &weight,
+        1, 1, 1, 1, 1, 16, 1e-6f, std::nullopt, epsilon,
+        OpTester::ExpectResult::kExpectFailure, "k_norm_epsilon must be finite and positive");
+  }
+}
+
+TEST(GroupQueryAttentionTest, WebGpuQKNormEpsilonOverrides) {
+  if (!DefaultWebGpuExecutionProvider()) {
+    GTEST_SKIP() << "WebGPU EP not available";
+  }
+
+  constexpr int num_heads = 2;
+  constexpr int head_size = 16;
+  constexpr float shared_epsilon = 1e-9f;
+  const std::vector<float> q_weight(head_size, 1.0f);
+  const std::vector<float> k_weight(head_size, 1.0f);
+  const std::vector<float> past_key(head_size, 0.25f);
+  const std::vector<float> past_value(head_size, -0.5f);
+  for (int sequence_length : {1, 3}) {
+    SCOPED_TRACE(sequence_length);
+    std::vector<float> query(sequence_length * num_heads * head_size);
+    std::vector<float> key(sequence_length * head_size);
+    std::vector<float> value(key.size());
+    for (size_t i = 0; i < query.size(); ++i) query[i] = 1e-4f * std::sin(static_cast<float>(i + 1));
+    for (size_t i = 0; i < key.size(); ++i) {
+      key[i] = 1e-4f * std::cos(static_cast<float>(i + 1));
+      value[i] = std::sin(static_cast<float>(i + 1));
+    }
+    for (bool override_q : {false, true}) {
+      for (bool override_k : {false, true}) {
+        SCOPED_TRACE(override_q);
+        SCOPED_TRACE(override_k);
+        const std::optional<float> q_epsilon = override_q ? std::make_optional(3e-9f) : std::nullopt;
+        const std::optional<float> k_epsilon = override_k ? std::make_optional(1.9e-9f) : std::nullopt;
+        auto ref_query = query;
+        auto ref_key = key;
+        ApplyPerHeadRmsNormBSNH(ref_query, 1, sequence_length, num_heads, head_size,
+                                q_weight, q_epsilon.value_or(shared_epsilon));
+        ApplyPerHeadRmsNormBSNH(ref_key, 1, sequence_length, 1, head_size,
+                                k_weight, k_epsilon.value_or(shared_epsilon));
+        const auto expected = RunGQARotaryWithOptionalQKNorm(
+            false, ref_query, ref_key, value, past_key, past_value, nullptr, nullptr,
+            1, sequence_length, 1, num_heads, 1, head_size, shared_epsilon);
+        const auto actual = RunGQARotaryWithOptionalQKNorm(
+            true, query, key, value, past_key, past_value, &q_weight, &k_weight,
+            1, sequence_length, 1, num_heads, 1, head_size, shared_epsilon, q_epsilon, k_epsilon);
+        ExpectOutputsMatch(actual, expected, 1e-4f, "WebGpuQKNormEpsilonOverrides");
+      }
+    }
+  }
 }
 
 TEST(GroupQueryAttentionTest, WebGpuQKNormWeightRotaryDecodeFunctional) {
@@ -1837,9 +1973,9 @@ TEST(GroupQueryAttentionTest, FlashDecoding_LocalWindow_Reference_CPU) {
   constexpr int kv_block_size = 16;
   constexpr int kv_chunk_count = (total_length + kv_block_size - 1) / kv_block_size;
   constexpr int thread_count = 12;
+  // thread_count fixes the MLAS task count, not the pool's DegreeOfParallelism (which varies by machine).
   concurrency::ThreadPool thread_pool(&Env::Default(), ThreadOptions{}, nullptr, thread_count,
                                       concurrency::kSpinDurationDefault, false);
-  ASSERT_EQ(concurrency::ThreadPool::DegreeOfParallelism(&thread_pool), thread_count);
   for (int head_size : {8, 24, 256}) {
     for (int window_size : {-1, 1, 24, 40}) {
       SCOPED_TRACE(testing::Message() << "head_size=" << head_size << " window=" << window_size);
@@ -3963,6 +4099,86 @@ TEST(GroupQueryAttentionTest, CudaAttentionBiasParityVsCpu) {
 }
 
 #ifdef USE_CUDA
+template <typename T, int SequenceLength = 32>
+static void RunGQAH512PrefillMemoryEfficientTest() {
+#if USE_MEMORY_EFFICIENT_ATTENTION
+  if (!HasCudaEnvironment(900)) {
+    GTEST_SKIP() << "H512 MEA numerical regression requires SM90+ shared-memory capacity";
+  }
+  auto cuda_ep = DefaultCudaExecutionProvider();
+  if (!cuda_ep) {
+    GTEST_SKIP() << "CUDA EP not available";
+  }
+  ScopedEnvironmentVariables scoped_env_vars{{
+      {"ORT_ENABLE_XQA", "0"},
+      {"ORT_ENABLE_CUDNN_FLASH_ATTENTION", "0"},
+      {"ORT_DISABLE_FLASH_ATTENTION", "1"},
+      {"ORT_DISABLE_MEMORY_EFFICIENT_ATTENTION", "0"},
+      {"ORT_ENABLE_ATTENTION_KERNEL_DEBUG_INFO", "1"},
+  }};
+  constexpr int sequence_length = SequenceLength;
+  constexpr int num_heads = 32;
+  constexpr int kv_num_heads = 8;
+  constexpr int head_size = 512;
+  constexpr int hidden_size = num_heads * head_size;
+  constexpr int kv_hidden_size = kv_num_heads * head_size;
+  std::vector<T> value(sequence_length * kv_hidden_size);
+  std::vector<T> present_value(sequence_length * kv_hidden_size);
+  std::vector<T> expected(sequence_length * hidden_size);
+  for (int token = 0; token < sequence_length; ++token) {
+    for (int head = 0; head < kv_num_heads; ++head) {
+      std::fill_n(value.begin() + token * kv_hidden_size + head * head_size, head_size,
+                  T(static_cast<float>(token + 1) / 32.0f + static_cast<float>(head) / 8.0f));
+      std::fill_n(present_value.begin() + (head * sequence_length + token) * head_size, head_size,
+                  T(static_cast<float>(token + 1) / 32.0f + static_cast<float>(head) / 8.0f));
+    }
+    for (int head = 0; head < num_heads; ++head) {
+      const int kv_head = head / (num_heads / kv_num_heads);
+      std::fill_n(expected.begin() + token * hidden_size + head * head_size, head_size,
+                  T(static_cast<float>(token + 2) / 64.0f + static_cast<float>(kv_head) / 8.0f));
+    }
+  }
+
+  OpTester tester("GroupQueryAttention", 1, onnxruntime::kMSDomain);
+  tester.AddAttribute<int64_t>("num_heads", num_heads);
+  tester.AddAttribute<int64_t>("kv_num_heads", kv_num_heads);
+  tester.AddInput<T>("query", {1, sequence_length, hidden_size},
+                     std::vector<T>(sequence_length * hidden_size, T(0.0f)));
+  tester.AddInput<T>("key", {1, sequence_length, kv_hidden_size},
+                     std::vector<T>(sequence_length * kv_hidden_size, T(0.0f)));
+  tester.AddInput<T>("value", {1, sequence_length, kv_hidden_size}, value);
+  tester.AddOptionalInputEdge<T>();
+  tester.AddOptionalInputEdge<T>();
+  tester.AddInput<int32_t>("seqlens_k", {1}, {sequence_length - 1});
+  tester.AddInput<int32_t>("total_sequence_length", {1}, {sequence_length}, true);
+  tester.AddOutput<T>("output", {1, sequence_length, hidden_size}, expected);
+  tester.AddOutput<T>("present_key", {1, kv_num_heads, sequence_length, head_size},
+                      std::vector<T>(sequence_length * kv_hidden_size, T(0.0f)));
+  tester.AddOutput<T>("present_value", {1, kv_num_heads, sequence_length, head_size}, present_value);
+  tester.SetOutputTolerance(0.005f);
+  std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+  execution_providers.push_back(std::move(cuda_ep));
+  SessionOptions options;
+  ASSERT_STATUS_OK(options.config_options.AddConfigEntry(kOrtSessionOptionsDisableCPUEPFallback, "1"));
+  testing::internal::CaptureStdout();
+  tester.Run(options, OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+  const std::string kernel_log = testing::internal::GetCapturedStdout();
+  EXPECT_NE(kernel_log.find("SdpaKernel=EFFICIENT_ATTENTION"), std::string::npos) << kernel_log;
+#else
+  GTEST_SKIP() << "Memory Efficient Attention is not compiled";
+#endif
+}
+
+TEST(GroupQueryAttentionTest, CudaH512PrefillMemoryEfficientFp16) {
+  RunGQAH512PrefillMemoryEfficientTest<MLFloat16, 1>();
+  RunGQAH512PrefillMemoryEfficientTest<MLFloat16>();
+}
+
+TEST(GroupQueryAttentionTest, CudaH512PrefillMemoryEfficientBf16) {
+  RunGQAH512PrefillMemoryEfficientTest<BFloat16, 1>();
+  RunGQAH512PrefillMemoryEfficientTest<BFloat16>();
+}
+
 static void RunGQACudaCacheAliasingTest(
     bool use_flash,
     bool sliding_window_cache = false,
@@ -3970,7 +4186,8 @@ static void RunGQACudaCacheAliasingTest(
     std::vector<float>* captured_output = nullptr,
     std::optional<int32_t> decode_seqlens_k = std::nullopt,
     bool shared_cache_only = false,
-    bool enable_flash_fast_decode = false) {
+    bool enable_flash_fast_decode = false,
+    bool packed_qkv = false) {
   ScopedEnvironmentVariables scoped_env_vars{{
       {"ORT_DISABLE_FLASH_ATTENTION", use_flash ? "0" : "1"},
       {"ORT_DISABLE_MEMORY_EFFICIENT_ATTENTION", "1"},
@@ -4007,7 +4224,11 @@ static void RunGQACudaCacheAliasingTest(
   fp16_type.mutable_tensor_type()->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT16);
   int32_type.mutable_tensor_type()->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_INT32);
   std::vector<NodeArg*> inputs;
-  for (const char* name : {"query", "key", "value", "past_key", "past_value"}) {
+  inputs.push_back(&graph.GetOrCreateNodeArg("query", &fp16_type));
+  for (const char* name : {"key", "value"}) {
+    inputs.push_back(&graph.GetOrCreateNodeArg(packed_qkv ? "" : name, packed_qkv ? nullptr : &fp16_type));
+  }
+  for (const char* name : {"past_key", "past_value"}) {
     inputs.push_back(&graph.GetOrCreateNodeArg(name, &fp16_type));
   }
   inputs.push_back(&graph.GetOrCreateNodeArg("seqlens_k", &int32_type));
@@ -4069,7 +4290,22 @@ static void RunGQACudaCacheAliasingTest(
   const auto value_data = make_data(kv_shape.Size(), 5);
   const auto past_key_data = make_data(cache_shape.Size(), 7);
   const auto past_value_data = make_data(cache_shape.Size(), 11);
-  auto query_value = make_gpu_value(make_data(query_shape.Size(), 1), query_shape);
+  const auto query_data = make_data(query_shape.Size(), 1);
+  OrtValue query_value;
+  if (packed_qkv) {
+    constexpr int packed_hidden_size = hidden_size + 2 * kv_hidden_size;
+    std::vector<MLFloat16> packed_data(static_cast<size_t>(batch_size) * sequence_length * packed_hidden_size);
+    for (int token = 0; token < batch_size * sequence_length; ++token) {
+      auto destination = packed_data.begin() + token * packed_hidden_size;
+      std::copy_n(query_data.begin() + token * hidden_size, hidden_size, destination);
+      std::copy_n(key_data.begin() + token * kv_hidden_size, kv_hidden_size, destination + hidden_size);
+      std::copy_n(value_data.begin() + token * kv_hidden_size, kv_hidden_size,
+                  destination + hidden_size + kv_hidden_size);
+    }
+    query_value = make_gpu_value(packed_data, {batch_size, sequence_length, packed_hidden_size});
+  } else {
+    query_value = make_gpu_value(query_data, query_shape);
+  }
   auto key_value = make_gpu_value(key_data, kv_shape);
   auto value_value = make_gpu_value(value_data, kv_shape);
   const int32_t seqlens_k_value = decode_seqlens_k.value_or(total_length - sequence_length);
@@ -4101,8 +4337,10 @@ static void RunGQACudaCacheAliasingTest(
       std::unique_ptr<IOBinding> binding;
       ASSERT_STATUS_OK(session.NewIOBinding(&binding));
       ASSERT_STATUS_OK(binding->BindInput("query", query_value));
-      ASSERT_STATUS_OK(binding->BindInput("key", key_value));
-      ASSERT_STATUS_OK(binding->BindInput("value", value_value));
+      if (!packed_qkv) {
+        ASSERT_STATUS_OK(binding->BindInput("key", key_value));
+        ASSERT_STATUS_OK(binding->BindInput("value", value_value));
+      }
       ASSERT_STATUS_OK(binding->BindInput("past_key", past_key_value));
       ASSERT_STATUS_OK(binding->BindInput("past_value", past_value_value));
       ASSERT_STATUS_OK(binding->BindInput("seqlens_k", seqlens_value));
@@ -4193,8 +4431,50 @@ static void RunGQACudaCacheAliasingTest(
   }
 }
 
+static void RunGQACudaPackedPreparationTest(bool use_flash, int windowed_sequence_length = 0) {
+  if (!DefaultCudaExecutionProvider()) {
+    GTEST_SKIP() << "CUDA EP not available";
+  }
+  if (use_flash && !HasCudaEnvironment(800)) {
+    GTEST_SKIP() << "FlashAttention requires SM80 or later";
+  }
+  std::vector<float> separate_output;
+  std::vector<float> packed_output;
+  const bool windowed = windowed_sequence_length > 0;
+  RunGQACudaCacheAliasingTest(use_flash, windowed, windowed_sequence_length, &separate_output);
+  RunGQACudaCacheAliasingTest(
+      use_flash, windowed, windowed_sequence_length, &packed_output, std::nullopt, false, false, true);
+  ASSERT_FALSE(separate_output.empty());
+  ASSERT_FALSE(packed_output.empty());
+  ExpectOutputsMatch(packed_output, separate_output, 0.002f, "packed preparation matches separate inputs");
+}
+
 TEST(GroupQueryAttentionTest, CudaCacheAliasingUnfused) {
   RunGQACudaCacheAliasingTest(false);
+}
+
+TEST(GroupQueryAttentionTest, CudaPackedPreparationUnfused) {
+  RunGQACudaPackedPreparationTest(false);
+}
+
+TEST(GroupQueryAttentionTest, CudaWindowedPackedPreparationUnfused) {
+  RunGQACudaPackedPreparationTest(false, 3);
+}
+
+TEST(GroupQueryAttentionTest, CudaPackedPreparationFlash) {
+#if USE_FLASH_ATTENTION
+  RunGQACudaPackedPreparationTest(true);
+#else
+  GTEST_SKIP() << "FlashAttention is not compiled";
+#endif
+}
+
+TEST(GroupQueryAttentionTest, CudaWindowedPackedPreparationFlash) {
+#if USE_FLASH_ATTENTION
+  RunGQACudaPackedPreparationTest(true, 3);
+#else
+  GTEST_SKIP() << "FlashAttention is not compiled";
+#endif
 }
 
 TEST(GroupQueryAttentionTest, CudaCacheAliasingFlash) {
